@@ -48,10 +48,23 @@ def fake_my_app():
 
 
 @pytest.fixture(autouse=True)
-def env(monkeypatch):
+def env(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("APP_VERSION", "1234567")
     monkeypatch.delenv("MY_APP_URL", raising=False)
+    monkeypatch.setenv("SECRETS_DIR", str(tmp_path / "secrets"))  # empty: no secret mounted unless a test writes one
+
+
+@pytest.fixture
+def database_url(tmp_path):
+    """Writes DATABASE_URL like the kubelet mounts it (one file per key, trailing newline)."""
+
+    def write(value):
+        secrets = tmp_path / "secrets"
+        secrets.mkdir(exist_ok=True)
+        (secrets / "DATABASE_URL").write_text(value + "\n", encoding="utf-8")
+
+    return write
 
 
 def test_probes_answer_200():
@@ -126,3 +139,54 @@ def test_only_http_urls_are_called(monkeypatch):
     dep = call("/")[2]["dependencies"]["my-app"]
     assert dep["reachable"] is False
     assert "http://" in dep["error"]
+
+
+def test_database_not_mounted():
+    db = call("/")[2]["database"]
+    assert db == {"configured": False, "error": "DATABASE_URL not found in the mounted secret"}
+
+
+def test_database_url_password_is_masked(database_url):
+    database_url("postgresql://orders_app:S3cr3t!pw@orders-db.dev.internal:5432/ordersdb?schema=orders&sslmode=require")
+    status, _, body = call("/dev/orders")
+    assert status == 200
+    assert body["database"] == {
+        "configured": True,
+        "valid": True,
+        "url": "postgresql://orders_app:########@orders-db.dev.internal:5432/ordersdb?schema=orders&sslmode=require",
+        "user": "orders_app",
+        "password": "########",
+        "host": "orders-db.dev.internal",
+        "port": 5432,
+        "database": "ordersdb",
+        "schema": "orders",
+    }
+
+
+def test_password_never_in_the_answer(database_url):
+    database_url("postgres://u:topsecret@db:6543/d?password=alsosecret")
+    _, _, body = call("/")
+    raw = json.dumps(body)
+    assert "topsecret" not in raw
+    assert "alsosecret" not in raw
+    assert body["database"]["port"] == 6543
+    assert body["database"]["schema"] == "public"  # no schema given: PostgreSQL's default
+
+
+def test_database_url_new_value_without_restart(database_url):
+    database_url("postgresql://a:x@db1/one")
+    assert call("/")[2]["database"]["database"] == "one"
+    database_url("postgresql://a:x@db2/two")  # what the kubelet does after a change in Secrets Manager
+    assert call("/")[2]["database"]["host"] == "db2"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["https://user:pw@host/db", "not a url", "postgresql://user:pw@host:notaport/db"],
+)
+def test_invalid_database_url_is_reported(database_url, value):
+    database_url(value)
+    db = call("/")[2]["database"]
+    assert db["configured"] is True
+    assert db["valid"] is False
+    assert "pw" not in json.dumps(db)

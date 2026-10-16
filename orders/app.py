@@ -1,7 +1,8 @@
 """WSGI application for orders: sample orders, and a call to my-app over the cluster network.
 
-Differs from my-app on purpose: Python instead of Node.js, no secrets and no AWS access, and it depends on another
-service (my-app). Configuration is read on every request, so tests can change it without reloading the module.
+Differs from my-app on purpose: Python instead of Node.js, no AWS access, and it depends on another service
+(my-app). Its secret (DATABASE_URL) is shown only with the password masked. Configuration and secrets are read on
+every request, so tests can change them without reloading the module.
 """
 
 import json
@@ -9,6 +10,7 @@ import os
 import socket
 import urllib.error
 import urllib.request
+from urllib.parse import parse_qsl, urlsplit
 
 # Demo data: read-only and in memory, so every replica answers the same and the root filesystem can stay read-only
 ORDERS = (
@@ -20,6 +22,63 @@ ORDERS = (
 UPSTREAM_TIMEOUT_SECONDS = 2
 
 STATUS_TEXT = {200: "200 OK", 404: "404 Not Found", 405: "405 Method Not Allowed"}
+
+# Shown instead of a password: proves the secret arrived without ever returning it
+MASK = "########"
+
+
+def read_secret(name):
+    """One key of the service's secret, mounted as a file by the chart (External Secrets → Kubernetes Secret).
+
+    Read on every call: when the value changes in Secrets Manager, the mounted file changes and the new value is
+    used without restarting the pod. None if the secret is not mounted (yet) or the key is missing.
+    """
+    secrets_dir = os.environ.get("SECRETS_DIR", "/etc/orders/secrets")
+    try:
+        with open(os.path.join(secrets_dir, name), encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def describe_database(url):
+    """The parts of DATABASE_URL (postgresql://user:password@host:5432/db?schema=s), password masked.
+
+    Only describes the value: there is no database in this demo, so nothing connects. Never raises and never
+    returns the password, also not one given as a query parameter (?password=...).
+    """
+    if url is None:
+        return {"configured": False, "error": "DATABASE_URL not found in the mounted secret"}
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return {"configured": True, "valid": False, "error": "DATABASE_URL is not a valid URL"}
+    if parts.scheme not in ("postgresql", "postgres") or not parts.hostname:
+        return {
+            "configured": True,
+            "valid": False,
+            "error": "DATABASE_URL must look like postgresql://user:password@host:5432/database",
+        }
+
+    params = parse_qsl(parts.query)
+    query = "&".join(f"{k}={MASK if 'password' in k.lower() else v}" for k, v in params)
+    user = parts.username or ""
+    credentials = f"{user}:{MASK}@" if parts.password is not None else (f"{user}@" if user else "")
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    address = f"{host}:{port}" if port else host
+    options = dict(params)
+    return {
+        "configured": True,
+        "valid": True,
+        "url": f"{parts.scheme}://{credentials}{address}{parts.path}" + (f"?{query}" if query else ""),
+        "user": user or None,
+        "password": MASK if parts.password is not None else None,
+        "host": parts.hostname,
+        "port": port or 5432,
+        "database": parts.path.lstrip("/") or None,
+        "schema": options.get("schema") or options.get("currentSchema") or "public",
+    }
 
 
 def check_my_app(url):
@@ -98,5 +157,6 @@ def application(environ, start_response):
             "path": path,
             "orders": len(ORDERS),
             "dependencies": {"my-app": check_my_app(os.environ.get("MY_APP_URL", ""))},
+            "database": describe_database(read_secret("DATABASE_URL")),
         },
     )

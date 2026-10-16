@@ -12,7 +12,7 @@ URL: `http://<alb>/<environment>/orders`.
 | Language / server | Node.js 22, `node:http` | Python 3.13, waitress (pure-Python WSGI server) |
 | Runtime dependencies | none | one (`waitress`), exact version + hash (`requirements.txt`) |
 | Talks to other services | no | yes: calls my-app at `MY_APP_URL` (`http://my-app`, same namespace) |
-| Secrets / AWS access | yes: `GREETING` secret, IRSA role | **none**: no ExternalSecret, no IAM role (`secrets.enabled: false`) |
+| Secrets / AWS access | `GREETING` secret, IRSA role | `DATABASE_URL` secret (shown **masked**), **no** IAM role |
 | Network policy | ALB → my-app | ALB → orders, **orders → my-app** (only this pair is opened) |
 | Lint / tests | ESLint, `node --test` | ruff (incl. security rules), pytest + coverage |
 | Dependency scan | npm audit + OWASP Dependency-Check | pip-audit (PyPI advisories + OSV) |
@@ -26,7 +26,7 @@ URL: `http://<alb>/<environment>/orders`.
 | `/healthz`, `/readyz` | liveness / readiness. They do **not** depend on my-app: if my-app is down, orders stays up and says so |
 | `.../api/orders` | the three sample orders |
 | `.../api/orders/<id>` | one order, or 404 |
-| anything else (e.g. `/dev/orders`) | service info: environment, version, pod, and `dependencies.my-app` (reachable? which version?) |
+| anything else (e.g. `/dev/orders`) | service info: environment, version, pod, `dependencies.my-app` (reachable? which version?) and `database` (the `DATABASE_URL` secret, password masked) |
 
 Example, in dev:
 ```bash
@@ -43,6 +43,22 @@ curl -s http://$ALB/dev/orders/api/orders/1001 | jq .
 | `APP_ENV` | `local` | Helm chart (`dev`, `staging`, `production`) |
 | `APP_VERSION` | `dev` | Helm chart (the image tag) |
 | `MY_APP_URL` | empty (= not configured) | helm-chart `apps/orders/values.yaml` (`extraEnv`) |
+| `SECRETS_DIR` | `/etc/orders/secrets` | Helm chart (where the secret's keys are mounted, one file per key) |
+
+### Secret: `DATABASE_URL`
+Stored as JSON in Secrets Manager, one entry per environment: `platform-dev/orders/<env>`
+(`{"DATABASE_URL":"postgresql://user:password@host:5432/database?schema=orders"}`). External Secrets copies it
+into the Kubernetes Secret `orders`; the chart mounts it as the file `$SECRETS_DIR/DATABASE_URL`.
+orders reads the file on every request, so a new value is used without a restart (within about 10 minutes:
+External Secrets refresh, then the kubelet), and answers only its parts with the password replaced by `########`:
+```json
+"database": { "configured": true, "valid": true,
+  "url": "postgresql://orders_app:########@orders-db.dev.internal:5432/ordersdb?schema=orders",
+  "user": "orders_app", "password": "########", "host": "orders-db.dev.internal", "port": 5432,
+  "database": "ordersdb", "schema": "orders" }
+```
+There is no database in this demo: nothing connects, the value is only checked and described. Locally:
+`mkdir -p /tmp/s && echo 'postgresql://u:p@localhost/db' > /tmp/s/DATABASE_URL && SECRETS_DIR=/tmp/s python -m orders.server`.
 
 ## Develop
 Python 3.13 or newer:
