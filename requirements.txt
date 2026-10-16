@@ -1,0 +1,4 @@
+# Runtime dependencies (go into the image). Exact versions with hashes: pip refuses anything else (--require-hashes).
+# Update: pip download --no-deps waitress==<new> && pip hash waitress-<new>-py3-none-any.whl
+waitress==3.0.2 \
+    --hash=sha256:c56d67fd6e87c2ee598b76abdd4e96cfad1f24cacdea5078d382b1f9d7b5ed2e

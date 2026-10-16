@@ -1,0 +1,314 @@
+# orders pipeline - same flow and gates as my-app, Python tools instead of Node.js ones, plus:
+#   - container test: the built image is started read-only and as non-root (like in the cluster), its endpoints are
+#     called and it must stop cleanly on SIGTERM - before it may be pushed
+#   - SBOM (CycloneDX) of the image, kept as a build artifact: what exactly is inside every image
+#
+#   Pull request → ALL checks (no AWS access): secrets, ruff + pytest + coverage, SonarQube Cloud quality gate,
+#                  pip-audit, Trivy filesystem, image build + Trivy + container test + Kyverno.
+#   Push to main → build, Trivy image, container test, Kyverno, push to ECR (GitHub OIDC, no keys), then a
+#                  deployment pull request in AjinOrg/helm-chart (apps/orders/values-dev.yaml) that merges itself.
+#   Staging/production: released on purpose (helm-chart release.yaml, release team).
+# Any failing check stops everything after it: a vulnerable or non-compliant image never reaches ECR.
+name: orders
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orders-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: 471112815218.dkr.ecr.ap-south-1.amazonaws.com/orders
+  ECR_PUSH_ROLE: arn:aws:iam::471112815218:role/orders-ecr-push # trusts only this repo's main branch; pushes only to orders
+  PLATFORM_OWNER: AjinOrg
+  PLATFORM_REPO: aws-platform # Kyverno policies (infra team)
+  DEPLOY_REPO: helm-chart     # shared chart, values per environment, deployment PRs (release team)
+  SERVICE: orders             # folder apps/orders/ in helm-chart
+  HELM_VERSION: v4.3.0
+  PYTHON_VERSION: "3.13"      # the same as the runtime image (distroless python3-debian13)
+
+jobs:
+  gitleaks:
+    name: Secrets scan (Gitleaks)
+    if: github.event_name == 'pull_request' # checks run on PRs (branch must be up to date with main)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: bash .github/scripts/install-ci-tools.sh gitleaks
+      - run: gitleaks git --redact --verbose --log-opts="HEAD" .
+
+  lint-test:
+    name: Lint + unit tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: |
+          pip install --require-hashes -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: ruff (lint, including security rules)
+        run: ruff check --output-format=github .
+      - name: ruff (formatting)
+        run: ruff format --check .
+      - name: pytest + coverage
+        run: pytest --cov --cov-report=term-missing --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+
+  sonar:
+    name: Code quality (SonarQube Cloud)
+    if: github.event_name == 'pull_request'
+    needs: lint-test
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: Sonar tells new code from old code (blame)
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+      - name: SonarQube Cloud scan + quality gate
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v5
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+      - name: SonarQube Cloud skipped
+        if: env.SONAR_TOKEN == ''
+        run: echo "::warning::SONAR_TOKEN secret not set - SonarQube Cloud analysis skipped."
+
+  dependencies:
+    name: Dependencies (pip-audit)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install "pip-audit==$(sed -nE 's/^pip-audit==([^ ]+).*/\1/p' requirements-dev.txt)"
+      # Python Packaging Advisory Database + OSV. Any known vulnerability fails (no severity filter in pip-audit)
+      - name: runtime dependencies (the ones in the image)
+        run: pip-audit --require-hashes --disable-pip -r requirements.txt
+      - name: development tools
+        run: pip-audit -r requirements-dev.txt
+
+  trivy-fs:
+    name: Filesystem scan (Trivy)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/scripts/install-ci-tools.sh trivy
+      - name: vulnerabilities, secrets and Dockerfile misconfigurations
+        run: trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .
+
+  image:
+    name: Build image + Trivy + container test + Kyverno (+ push on main)
+    needs: [gitleaks, lint-test, sonar, dependencies, trivy-fs]
+    # PR: all checks must succeed. main: the checks are skipped (they passed on the up-to-date PR), so run unless
+    # a needed job failed or was cancelled
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # lets this job request a GitHub OIDC token for AWS (used only on main)
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      registered: ${{ steps.kyverno.outputs.registered }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+      - run: bash .github/scripts/install-ci-tools.sh trivy kyverno
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: build
+        run: docker build -t "$ECR_REPOSITORY:${{ steps.meta.outputs.tag }}" .
+
+      - name: Trivy image scan (HIGH/CRITICAL with a fix available fail)
+        run: trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ECR_REPOSITORY:${{ steps.meta.outputs.tag }}"
+
+      - name: SBOM (CycloneDX)
+        run: trivy image --format cyclonedx --output sbom.cdx.json "$ECR_REPOSITORY:${{ steps.meta.outputs.tag }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.meta.outputs.tag }}
+          path: sbom.cdx.json
+
+      # Run the image the way the cluster does (read-only root filesystem, uid 65532, no capabilities) and check it
+      # answers, reports the right version, and exits 0 on SIGTERM (graceful shutdown = zero-downtime rollouts)
+      - name: container test
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          fail() { echo "::error::$1"; docker logs orders-test || true; exit 1; }
+          docker run -d --name orders-test --read-only --user 65532:65532 --cap-drop ALL \
+            --security-opt no-new-privileges -p 8080:8080 \
+            -e APP_ENV=ci -e APP_VERSION="$TAG" -e MY_APP_URL=http://127.0.0.1:1 "$ECR_REPOSITORY:$TAG"
+          for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:8080/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8080/readyz >/dev/null                         || fail "/readyz failed"
+          BODY=$(curl -fsS http://127.0.0.1:8080/ci/orders)                         || fail "GET /ci/orders failed"
+          echo "$BODY" | jq .
+          [ "$(echo "$BODY" | jq -r .version)" = "$TAG" ]                           || fail "wrong version"
+          [ "$(echo "$BODY" | jq -r '.dependencies["my-app"].reachable')" = false ] || fail "my-app should be unreachable here"
+          [ "$(curl -fsS http://127.0.0.1:8080/ci/orders/api/orders | jq .count)" = 3 ] || fail "order list"
+          docker stop --time 15 orders-test >/dev/null # sends SIGTERM
+          CODE=$(docker inspect orders-test --format '{{.State.ExitCode}}')
+          docker logs orders-test
+          [ "$CODE" = 0 ] || fail "exit code $CODE after SIGTERM (expected 0: graceful shutdown)"
+
+      # The same policies the cluster enforces (aws-platform), applied to the shared chart with orders' values
+      # (helm-chart) and THIS image
+      - name: checkout platform policies
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_OWNER }}/${{ env.PLATFORM_REPO }}
+          path: platform
+          sparse-checkout: policies/kyverno
+      - name: checkout chart and values
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_OWNER }}/${{ env.DEPLOY_REPO }}
+          path: deploy
+      - name: Kyverno policies
+        id: kyverno
+        run: |
+          # A brand-new service has no apps/orders in helm-chart until its first image exists (that PR's values need
+          # a real tag). Until then nothing can deploy this image, and helm-chart's own ci runs these same policies
+          # on the PR that registers it.
+          if [ ! -d "deploy/apps/$SERVICE" ]; then
+            echo "registered=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::apps/$SERVICE does not exist in $DEPLOY_REPO yet - Kyverno check skipped (first image only)"
+            exit 0
+          fi
+          echo "registered=true" >> "$GITHUB_OUTPUT"
+          for env in dev staging production; do
+            helm template "$SERVICE" deploy/charts/microservice -n "$env" \
+              -f "deploy/apps/$SERVICE/values.yaml" -f "deploy/apps/$SERVICE/values-$env.yaml" \
+              --set image.tag="${{ steps.meta.outputs.tag }}" > "rendered-$env.yaml"
+            kyverno apply platform/policies/kyverno --resource "rendered-$env.yaml"
+          done
+
+      # ---- main only: publish
+      - name: AWS credentials (GitHub OIDC → role orders-ecr-push, 1 hour)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ECR_PUSH_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: push to ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY%/*}"
+          # Tags are immutable: a re-run for the same commit must not fail
+          if aws ecr describe-images --repository-name "$SERVICE" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "Image $TAG already in ECR - not pushed again"
+          else
+            docker push "$ECR_REPOSITORY:$TAG"
+          fi
+          echo "### Image pushed: \`$ECR_REPOSITORY:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-dev:
+    name: Deployment pull request (dev)
+    needs: image
+    # Explicit status check: without it GitHub adds success(), which is false because the check jobs before
+    # "image" are skipped on main. Run only when the image job itself succeeded.
+    if: ${{ !cancelled() && needs.image.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    # One deployment PR at a time: later pushes wait, and the newest tag wins (older open PRs are closed)
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    steps:
+      - name: service registered in helm-chart?
+        if: needs.image.outputs.registered != 'true'
+        run: |
+          {
+            echo "### First image \`${{ needs.image.outputs.tag }}\` is in ECR - now register orders in helm-chart"
+            echo "Add \`apps/$SERVICE/\` in $PLATFORM_OWNER/$DEPLOY_REPO with \`image.tag: \"${{ needs.image.outputs.tag }}\"\`"
+            echo "(steps: README of this repository, \"First deployment\"). Later pushes then open the dev PR automatically."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: GitHub App configured?
+        if: needs.image.outputs.registered == 'true' && vars.PLATFORM_APP_ID == ''
+        run: |
+          echo "::warning::GitHub App not configured (variable PLATFORM_APP_ID, secret PLATFORM_APP_PRIVATE_KEY)."
+          echo "Deploy by hand: set image.tag to ${{ needs.image.outputs.tag }} in apps/$SERVICE/values-dev.yaml of $PLATFORM_OWNER/$DEPLOY_REPO" >> "$GITHUB_STEP_SUMMARY"
+
+      # Short-lived (1 hour) token of a GitHub App, limited here to helm-chart: no personal token stored.
+      # PRs opened with it also trigger helm-chart's ci (PRs opened with GITHUB_TOKEN would not).
+      - id: app-token
+        if: needs.image.outputs.registered == 'true' && vars.PLATFORM_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PLATFORM_APP_ID }}
+          private-key: ${{ secrets.PLATFORM_APP_PRIVATE_KEY }}
+          owner: ${{ env.PLATFORM_OWNER }}
+          repositories: ${{ env.DEPLOY_REPO }}
+
+      - if: steps.app-token.outcome == 'success'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_OWNER }}/${{ env.DEPLOY_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: open the dev pull request (merges itself when helm-chart ci passes; no approval needed for dev)
+        if: steps.app-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.image.outputs.tag }}
+        run: |
+          FILE="apps/$SERVICE/values-dev.yaml"
+          BRANCH="deploy/dev/$SERVICE-$TAG"
+          REPO="$PLATFORM_OWNER/$DEPLOY_REPO"
+
+          # Newest tag wins: close dev deployment PRs of THIS service that are still open for older tags
+          for old in $(gh pr list -R "$REPO" --state open --json headRefName \
+                         --jq ".[].headRefName | select(test(\"^deploy/dev/$SERVICE-[0-9a-f]{7}\$\"))"); do
+            [ "$old" = "$BRANCH" ] && continue
+            gh pr close "$old" -R "$REPO" --delete-branch --comment "Superseded by $SERVICE $TAG"
+          done
+
+          sed -i -E "s/^(  tag: ).*/\1\"$TAG\"/" "$FILE"
+          if git diff --quiet; then echo "dev already runs $TAG"; exit 0; fi
+          # Commit as the GitHub App's own bot account, so every commit is attributed to the app
+          SLUG="${{ steps.app-token.outputs.app-slug }}"
+          BOT_ID=$(gh api "users/${SLUG}%5Bbot%5D" --jq .id)
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${BOT_ID}+${SLUG}[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "deploy(dev): $SERVICE $TAG"
+          git push --force origin "$BRANCH"
+          gh pr create -R "$REPO" --base main --head "$BRANCH" \
+            --title "deploy(dev): $SERVICE $TAG" \
+            --body "Automatic dev deployment of \`$ECR_REPOSITORY:$TAG\`.
+          Checks passed in $SERVICE: Gitleaks, ruff, pytest, SonarQube Cloud, pip-audit, Trivy (fs + image), container test, Kyverno.
+          Source: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          Merges itself when ci passes. After the sync, verify.yaml smoke-tests dev. Staging is released on purpose (release.yaml)."
+          gh pr merge "$BRANCH" -R "$REPO" --auto --squash --delete-branch
+          echo "### Dev deployment PR opened for \`$TAG\` (auto-merge)" >> "$GITHUB_STEP_SUMMARY"

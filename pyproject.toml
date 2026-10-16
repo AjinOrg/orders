@@ -1,0 +1,24 @@
+[project]
+name = "orders"
+version = "0.1.0"
+description = "Sample orders service deployed on the aws-platform EKS cluster; calls my-app"
+requires-python = ">=3.13"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+# E/F: errors, I: import order, B: likely bugs, S: security (bandit rules), UP: modern syntax
+select = ["E", "F", "I", "B", "S", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S310"] # assert is how pytest checks; tests call a local fake server
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+
+[tool.coverage.run]
+source = ["orders"]
+omit = ["orders/server.py"] # only starts waitress and handles signals; the CI container test covers it

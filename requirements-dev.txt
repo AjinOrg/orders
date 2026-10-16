@@ -1,0 +1,7 @@
+# Development and CI tools only (never in the image). Install the runtime ones first:
+#   pip install --require-hashes -r requirements.txt && pip install -r requirements-dev.txt
+# (kept apart: once one line has a hash, pip demands hashes for every line)
+pytest==9.1.1
+pytest-cov==7.1.0
+ruff==0.17.1
+pip-audit==2.10.1
